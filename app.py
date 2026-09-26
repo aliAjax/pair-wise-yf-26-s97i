@@ -1,4 +1,4 @@
-"""数字档案长期保存服务：SQLite 多副本、哈希校验、修复与迁移。"""
+"""数字档案长期保存服务：SQLite 多副本、哈希校验、副本退役替换与格式迁移。"""
 from __future__ import annotations
 
 import argparse
@@ -71,6 +71,7 @@ class PreservationStore:
 
     def init_schema(self) -> None:
         with self._lock, self.connect() as conn:
+            self._migrate_copies_table(conn)
             conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS users(
@@ -113,7 +114,7 @@ class PreservationStore:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     version_id INTEGER NOT NULL REFERENCES archive_versions(id),
                     location TEXT NOT NULL,
-                    state TEXT NOT NULL DEFAULT 'healthy' CHECK(state IN ('healthy','corrupt','degraded')),
+                    state TEXT NOT NULL DEFAULT 'healthy' CHECK(state IN ('healthy','corrupt','pending_retirement','pending_verification','retired')),
                     created_at TEXT NOT NULL,
                     last_verified_at TEXT,
                     UNIQUE(version_id,location)
@@ -125,6 +126,22 @@ class PreservationStore:
                     size INTEGER NOT NULL,
                     content BLOB NOT NULL,
                     PRIMARY KEY(copy_id,path)
+                );
+                CREATE TABLE IF NOT EXISTS copy_incidents(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    copy_id INTEGER NOT NULL REFERENCES copies(id),
+                    version_id INTEGER NOT NULL REFERENCES archive_versions(id),
+                    location TEXT NOT NULL,
+                    corrupt_paths TEXT NOT NULL,
+                    detected_at TEXT NOT NULL,
+                    detected_by TEXT NOT NULL REFERENCES users(id),
+                    resolved_by_copy_id INTEGER REFERENCES copies(id),
+                    resolved_at TEXT
+                );
+                CREATE TABLE IF NOT EXISTS retired_locations(
+                    location TEXT PRIMARY KEY,
+                    copy_id INTEGER NOT NULL REFERENCES copies(id),
+                    retired_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS migrations(
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -146,6 +163,60 @@ class PreservationStore:
                 );
                 """
             )
+
+    def _migrate_copies_table(self, conn: sqlite3.Connection) -> None:
+        """旧库的 copies 表 CHECK 约束不含退役流程状态，需要重建表。"""
+        row = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='copies'").fetchone()
+        if not row or "pending_retirement" in row["sql"]:
+            return
+        conn.execute("PRAGMA foreign_keys=OFF")
+        conn.execute("PRAGMA legacy_alter_table=ON")
+        conn.executescript(
+            """
+            ALTER TABLE copies RENAME TO copies_old;
+            CREATE TABLE copies(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                version_id INTEGER NOT NULL REFERENCES archive_versions(id),
+                location TEXT NOT NULL,
+                state TEXT NOT NULL DEFAULT 'healthy' CHECK(state IN ('healthy','corrupt','pending_retirement','pending_verification','retired')),
+                created_at TEXT NOT NULL,
+                last_verified_at TEXT,
+                UNIQUE(version_id,location)
+            );
+            INSERT INTO copies(id,version_id,location,state,created_at,last_verified_at)
+                SELECT id,version_id,location,state,created_at,last_verified_at FROM copies_old;
+            DROP TABLE copies_old;
+            """
+        )
+        conn.execute("PRAGMA legacy_alter_table=OFF")
+        conn.execute("PRAGMA foreign_keys=ON")
+
+    def _refresh_version_state(self, conn: sqlite3.Connection, version_id: int) -> None:
+        healthy = conn.execute(
+            "SELECT COUNT(*) FROM copies WHERE version_id=? AND state='healthy'", (version_id,)
+        ).fetchone()[0]
+        conn.execute(
+            "UPDATE archive_versions SET state=? WHERE id=?",
+            ("verified" if healthy >= 2 else "degraded", version_id),
+        )
+
+    def _protection(self, conn: sqlite3.Connection, version_id: int) -> dict:
+        copies = conn.execute(
+            "SELECT state,last_verified_at FROM copies WHERE version_id=?", (version_id,)
+        ).fetchall()
+        healthy = sum(1 for c in copies if c["state"] == "healthy")
+        missing = []
+        if healthy == 0:
+            missing.append("缺少健康副本")
+        elif healthy < 2:
+            missing.append("健康副本不足两份，缺少冗余保障")
+        if any(c["state"] == "pending_retirement" for c in copies):
+            missing.append("存在待退役副本，需登记新存储位置完成替换")
+        if any(c["state"] == "corrupt" for c in copies):
+            missing.append("存在损坏待巡检确认的副本")
+        if any(c["state"] != "retired" and c["last_verified_at"] is None for c in copies):
+            missing.append("存在尚未校验的副本")
+        return {"healthy_copies": healthy, "protected": healthy >= 2, "missing_safeguards": missing}
 
     def seed(self) -> None:
         self.init_schema()
@@ -253,6 +324,7 @@ class PreservationStore:
                         "INSERT INTO archive_files(version_id,path,sha256,size,content) VALUES(?,?,?,?,?)",
                         (version_id, item["path"], item["sha256"], item["size"], item["content"]),
                     )
+                self._refresh_version_state(conn, version_id)
                 self._audit(
                     conn, archive_id, actor_id, "version.ingest",
                     {"version_id": version_id, "version": version_no, "files": len(manifest),
@@ -275,6 +347,8 @@ class PreservationStore:
             self._access(conn, version["archive_id"], actor, require_write=True)
             try:
                 conn.execute("BEGIN IMMEDIATE")
+                if conn.execute("SELECT 1 FROM retired_locations WHERE location=?", (location,)).fetchone():
+                    raise BusinessError("该存储位置已退役，不能再登记副本", 409, "location_retired")
                 cur = conn.execute(
                     "INSERT INTO copies(version_id,location,created_at,last_verified_at) VALUES(?,?,?,?)",
                     (version_id, location, now(), now()),
@@ -285,6 +359,7 @@ class PreservationStore:
                        SELECT ?,path,sha256,size,content FROM archive_files WHERE version_id=?""",
                     (copy_id, version_id),
                 )
+                self._refresh_version_state(conn, version_id)
                 self._audit(conn, version["archive_id"], actor_id, "copy.create", {"copy_id": copy_id, "version_id": version_id, "location": location})
                 return {"id": copy_id, "version_id": version_id, "location": location, "state": "healthy"}
             except sqlite3.IntegrityError:
@@ -307,10 +382,19 @@ class PreservationStore:
             copies = conn.execute(
                 "SELECT id,location,state,last_verified_at FROM copies WHERE version_id=? ORDER BY id", (version_id,)
             ).fetchall()
+            incidents = conn.execute(
+                "SELECT * FROM copy_incidents WHERE version_id=? ORDER BY id", (version_id,)
+            ).fetchall()
             archive = conn.execute("SELECT * FROM archives WHERE id=?", (version["archive_id"],)).fetchone()
-            return {"version": dict(version), "archive": dict(archive), "files": [dict(x) for x in files], "copies": [dict(x) for x in copies]}
+            return {
+                "version": dict(version), "archive": dict(archive),
+                "files": [dict(x) for x in files], "copies": [dict(x) for x in copies],
+                "incidents": [dict(i) | {"corrupt_paths": json.loads(i["corrupt_paths"])} for i in incidents],
+                "protection": self._protection(conn, version_id),
+            }
 
     def verify_copy(self, user_id: str, copy_id: int) -> dict:
+        """巡检副本：发现损坏时记录损坏清单和发现时间，副本进入待退役，不再原地修复。"""
         with self.connect() as conn:
             user = self._user(conn, user_id, {"owner", "archivist", "auditor"})
             try:
@@ -318,49 +402,112 @@ class PreservationStore:
                 copy = conn.execute("SELECT * FROM copies WHERE id=?", (copy_id,)).fetchone()
                 if not copy:
                     raise BusinessError("副本不存在", 404, "not_found")
+                if copy["state"] == "retired":
+                    raise BusinessError("副本已退役，不再参与巡检", 409, "copy_retired")
                 version = conn.execute("SELECT * FROM archive_versions WHERE id=?", (copy["version_id"],)).fetchone()
                 self._access(conn, version["archive_id"], user)
                 stored = conn.execute(
                     "SELECT path,sha256,size,content FROM copy_files WHERE copy_id=? ORDER BY path", (copy_id,)
                 ).fetchall()
                 corrupt_paths = [r["path"] for r in stored if hashlib.sha256(r["content"]).hexdigest() != r["sha256"] or len(r["content"]) != r["size"]]
-                repaired = False
+                incident_id, detected_at = None, None
                 if not corrupt_paths:
                     conn.execute("UPDATE copies SET state='healthy',last_verified_at=? WHERE id=?", (now(), copy_id))
                     result_state = "healthy"
                 else:
-                    conn.execute("UPDATE copies SET state='corrupt',last_verified_at=? WHERE id=?", (now(), copy_id))
-                    healthy = conn.execute(
-                        "SELECT id FROM copies WHERE version_id=? AND id<>? AND state='healthy' ORDER BY last_verified_at DESC LIMIT 1",
-                        (copy["version_id"], copy_id),
+                    result_state = "pending_retirement"
+                    incident = conn.execute(
+                        "SELECT id,detected_at FROM copy_incidents WHERE copy_id=? AND resolved_at IS NULL ORDER BY id DESC LIMIT 1",
+                        (copy_id,),
                     ).fetchone()
-                    result_state = "degraded"
-                    if healthy:
-                        donor = conn.execute(
-                            "SELECT path,sha256,size,content FROM copy_files WHERE copy_id=? ORDER BY path", (healthy["id"],)
-                        ).fetchall()
-                        donor_by_path = {r["path"]: r for r in donor}
-                        expected = {r["path"]: r for r in conn.execute(
-                            "SELECT path,sha256,size FROM archive_files WHERE version_id=?", (copy["version_id"],)
-                        ).fetchall()}
-                        if set(donor_by_path) == set(expected) and all(
-                            hashlib.sha256(donor_by_path[p]["content"]).hexdigest() == expected[p]["sha256"] for p in expected
-                        ):
-                            conn.execute("DELETE FROM copy_files WHERE copy_id=?", (copy_id,))
-                            conn.execute(
-                                """INSERT INTO copy_files(copy_id,path,sha256,size,content)
-                                   SELECT ?,path,sha256,size,content FROM copy_files WHERE copy_id=?""",
-                                (copy_id, healthy["id"]),
-                            )
-                            conn.execute("UPDATE copies SET state='healthy',last_verified_at=? WHERE id=?", (now(), copy_id))
-                            repaired, result_state = True, "healthy"
-                    if result_state == "degraded":
-                        conn.execute("UPDATE archive_versions SET state='degraded' WHERE id=?", (copy["version_id"],))
+                    if incident:
+                        incident_id, detected_at = incident["id"], incident["detected_at"]
+                    else:
+                        detected_at = now()
+                        cur = conn.execute(
+                            "INSERT INTO copy_incidents(copy_id,version_id,location,corrupt_paths,detected_at,detected_by) VALUES(?,?,?,?,?,?)",
+                            (copy_id, copy["version_id"], copy["location"], json.dumps(corrupt_paths, ensure_ascii=False), detected_at, user_id),
+                        )
+                        incident_id = cur.lastrowid
+                    conn.execute("UPDATE copies SET state='pending_retirement',last_verified_at=? WHERE id=?", (now(), copy_id))
+                self._refresh_version_state(conn, copy["version_id"])
                 self._audit(
                     conn, version["archive_id"], user_id, "copy.verify",
-                    {"copy_id": copy_id, "state": result_state, "corrupt_paths": corrupt_paths, "repaired": repaired},
+                    {"copy_id": copy_id, "state": result_state, "corrupt_paths": corrupt_paths, "incident_id": incident_id},
                 )
-                return {"copy_id": copy_id, "state": result_state, "corrupt_paths": corrupt_paths, "repaired": repaired}
+                return {"copy_id": copy_id, "state": result_state, "corrupt_paths": corrupt_paths,
+                        "incident_id": incident_id, "detected_at": detected_at}
+            except Exception:
+                conn.rollback()
+                raise
+
+    def replace_copy(self, actor_id: str, copy_id: int, location: str) -> dict:
+        """为待退役副本登记新存储位置：重建全部文件并逐一校验，全部通过后新副本才接替，旧位置永久退役。"""
+        location = location.strip()
+        if len(location) < 2:
+            raise BusinessError("副本位置不能为空", 422, "invalid_location")
+        with self.connect() as conn:
+            actor = self._user(conn, actor_id, {"owner", "archivist"})
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                copy = conn.execute("SELECT * FROM copies WHERE id=?", (copy_id,)).fetchone()
+                if not copy:
+                    raise BusinessError("副本不存在", 404, "not_found")
+                version = conn.execute("SELECT * FROM archive_versions WHERE id=?", (copy["version_id"],)).fetchone()
+                self._access(conn, version["archive_id"], actor, require_write=True)
+                if copy["state"] != "pending_retirement":
+                    raise BusinessError("只有待退役的副本才能登记替换位置", 409, "copy_not_pending_retirement")
+                if conn.execute("SELECT 1 FROM retired_locations WHERE location=?", (location,)).fetchone():
+                    raise BusinessError("该存储位置已退役，不能再登记副本", 409, "location_retired")
+                if conn.execute("SELECT 1 FROM copies WHERE version_id=? AND location=?", (copy["version_id"], location)).fetchone():
+                    raise BusinessError("该版本的副本位置已存在", 409, "copy_exists")
+                cur = conn.execute(
+                    "INSERT INTO copies(version_id,location,state,created_at) VALUES(?,?,'pending_verification',?)",
+                    (copy["version_id"], location, now()),
+                )
+                new_copy_id = cur.lastrowid
+                conn.execute(
+                    """INSERT INTO copy_files(copy_id,path,sha256,size,content)
+                       SELECT ?,path,sha256,size,content FROM archive_files WHERE version_id=?""",
+                    (new_copy_id, copy["version_id"]),
+                )
+                expected = {r["path"]: r for r in conn.execute(
+                    "SELECT path,sha256,size FROM archive_files WHERE version_id=?", (copy["version_id"],)
+                ).fetchall()}
+                rebuilt = conn.execute(
+                    "SELECT path,sha256,size,content FROM copy_files WHERE copy_id=?", (new_copy_id,)
+                ).fetchall()
+                mismatches = []
+                if {r["path"] for r in rebuilt} != set(expected):
+                    mismatches.append("<文件清单不一致>")
+                else:
+                    for r in rebuilt:
+                        want = expected[r["path"]]
+                        if (r["sha256"] != want["sha256"] or r["size"] != want["size"]
+                                or len(r["content"]) != want["size"]
+                                or hashlib.sha256(r["content"]).hexdigest() != want["sha256"]):
+                            mismatches.append(r["path"])
+                if mismatches:
+                    raise BusinessError("新副本校验未通过: " + ", ".join(mismatches), 422, "replacement_verification_failed")
+                finished_at = now()
+                conn.execute("UPDATE copies SET state='healthy',last_verified_at=? WHERE id=?", (finished_at, new_copy_id))
+                conn.execute("UPDATE copies SET state='retired' WHERE id=?", (copy_id,))
+                conn.execute(
+                    "INSERT INTO retired_locations(location,copy_id,retired_at) VALUES(?,?,?)",
+                    (copy["location"], copy_id, finished_at),
+                )
+                conn.execute(
+                    "UPDATE copy_incidents SET resolved_by_copy_id=?,resolved_at=? WHERE copy_id=? AND resolved_at IS NULL",
+                    (new_copy_id, finished_at, copy_id),
+                )
+                self._refresh_version_state(conn, copy["version_id"])
+                self._audit(
+                    conn, version["archive_id"], actor_id, "copy.replace",
+                    {"old_copy_id": copy_id, "old_location": copy["location"], "new_copy_id": new_copy_id,
+                     "new_location": location, "verified_files": len(expected)},
+                )
+                return {"old_copy_id": copy_id, "old_location": copy["location"], "new_copy_id": new_copy_id,
+                        "new_location": location, "state": "healthy", "verified_files": len(expected)}
             except Exception:
                 conn.rollback()
                 raise
@@ -372,6 +519,8 @@ class PreservationStore:
             copy = conn.execute("SELECT * FROM copies WHERE id=?", (copy_id,)).fetchone()
             if not copy:
                 raise BusinessError("副本不存在", 404, "not_found")
+            if copy["state"] == "retired":
+                raise BusinessError("副本已退役，不能再模拟损坏", 409, "copy_retired")
             version = conn.execute("SELECT * FROM archive_versions WHERE id=?", (copy["version_id"],)).fetchone()
             self._access(conn, version["archive_id"], user, require_write=True)
             row = conn.execute("SELECT content FROM copy_files WHERE copy_id=? AND path=?", (copy_id, path)).fetchone()
@@ -420,6 +569,7 @@ class PreservationStore:
                     "INSERT INTO migrations(source_version_id,target_version_id,source_path,target_path,target_format,actor_id,created_at) VALUES(?,?,?,?,?,?,?)",
                     (version_id, target_version_id, source_path, converted["path"], target_format.strip(), actor_id, now()),
                 )
+                self._refresh_version_state(conn, target_version_id)
                 self._audit(
                     conn, source_version["archive_id"], actor_id, "format.migrate",
                     {"source_version_id": version_id, "target_version_id": target_version_id,
@@ -441,7 +591,8 @@ class PreservationStore:
                 "archive": dict(archive),
                 "days_remaining": (deadline - date.today()).days,
                 "versions": [dict(v) | {"file_count": conn.execute("SELECT COUNT(*) FROM archive_files WHERE version_id=?", (v["id"],)).fetchone()[0],
-                                         "copy_count": conn.execute("SELECT COUNT(*) FROM copies WHERE version_id=?", (v["id"],)).fetchone()[0]}
+                                         "copy_count": conn.execute("SELECT COUNT(*) FROM copies WHERE version_id=? AND state<>'retired'", (v["id"],)).fetchone()[0]}
+                             | self._protection(conn, v["id"])
                              for v in versions],
                 "audit": [dict(r) | {"detail": json.loads(r["detail"])} for r in conn.execute("SELECT * FROM audit_log WHERE archive_id=? ORDER BY id", (archive_id,)).fetchall()],
             }
@@ -509,6 +660,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(201, store.migrate(user, int(parts[2]), d.get("source_path", ""), d.get("target_path", ""), d.get("target_format", ""), d.get("content_b64", "")))
         if len(parts) == 4 and parts[:2] == ["api", "copies"] and parts[3] == "verify" and method == "POST":
             return self._send(200, store.verify_copy(user, int(parts[2])))
+        if len(parts) == 4 and parts[:2] == ["api", "copies"] and parts[3] == "replace" and method == "POST":
+            d = self._body()
+            return self._send(201, store.replace_copy(user, int(parts[2]), d.get("location", "")))
         if len(parts) == 4 and parts[:2] == ["api", "copies"] and parts[3] == "simulate-corruption" and method == "POST":
             d = self._body()
             return self._send(200, store.simulate_corruption(user, int(parts[2]), d.get("path", "")))

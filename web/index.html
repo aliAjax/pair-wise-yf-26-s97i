@@ -1,7 +1,30 @@
 <!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>数字档案长期保存</title>
-<style>body{font:16px system-ui;max-width:980px;margin:32px auto;padding:0 16px}input,textarea,button,select{font:inherit;padding:8px;margin:4px}textarea{width:100%;height:110px}.panel{border:1px solid #bbb;padding:16px;border-radius:8px;margin:12px 0}pre{background:#f4f4f4;padding:12px;white-space:pre-wrap}</style></head>
+<style>body{font:16px system-ui;max-width:980px;margin:32px auto;padding:0 16px}input,textarea,button,select{font:inherit;padding:8px;margin:4px}textarea{width:100%;height:110px}.panel{border:1px solid #bbb;padding:16px;border-radius:8px;margin:12px 0}pre{background:#f4f4f4;padding:12px;white-space:pre-wrap}table{border-collapse:collapse;margin:8px 0}td,th{border:1px solid #ccc;padding:6px 10px;text-align:left}.badge{display:inline-block;padding:2px 10px;border-radius:10px;color:#fff;font-size:14px}.badge.ok{background:#2e7d32}.badge.bad{background:#c62828}.ver{border-left:4px solid #ccc;padding:8px 12px;margin:8px 0}.ver.ok{border-color:#2e7d32}.ver.bad{border-color:#c62828}.missing{color:#c62828;margin:6px 0}</style></head>
 <body><h1>数字档案长期保存</h1><p>演示账号：owner、archivist、auditor、outsider。请求使用 <code>X-User-Id</code>。</p>
 <section class="panel"><select id="user"><option>owner</option><option>archivist</option><option>auditor</option><option>outsider</option></select>
-<button onclick="loadStatus()">查看档案状态</button><pre id="out"></pre></section>
-<p>详细接口见 README。页面用于完成初始化后的状态检查，核心流程由 JSON API 提供。</p>
-<script>const out=document.querySelector("#out"),user=document.querySelector("#user");async function loadStatus(){const id=prompt("档案 ID","1");const r=await fetch(`/api/archives/${id}/status`,{headers:{"X-User-Id":user.value}});out.textContent=JSON.stringify(await r.json(),null,2)}</script></body></html>
+<button onclick="loadStatus()">查看档案状态</button><button onclick="loadVersion()">查看版本详情</button>
+<div id="summary"></div><pre id="out"></pre></section>
+<p>版本至少有两份健康副本才视为受保护；巡检发现损坏的副本会留下损坏清单并进入待退役，需登记新存储位置重建校验后接替，退役位置不可再登记。详细接口见 README。</p>
+<script>
+const out=document.querySelector("#out"),user=document.querySelector("#user"),summary=document.querySelector("#summary");
+const STATE={healthy:"健康",corrupt:"损坏待巡检",pending_retirement:"待退役",pending_verification:"待校验",retired:"已退役",verified:"受保护",degraded:"保障不足"};
+const esc=s=>String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+function protectionHtml(p){const badge=p.protected?'<span class="badge ok">受保护</span>':'<span class="badge bad">未受保护</span>';
+const missing=p.protected?"":`<div class="missing">缺少的保障：<ul>${p.missing_safeguards.map(m=>`<li>${esc(m)}</li>`).join("")}</ul></div>`;
+return `${badge} 健康副本 ${p.healthy_copies} 份${missing}`}
+async function loadStatus(){const id=prompt("档案 ID","1");if(!id)return;
+const r=await fetch(`/api/archives/${id}/status`,{headers:{"X-User-Id":user.value}});const data=await r.json();
+out.textContent=JSON.stringify(data,null,2);
+if(!data.versions){summary.innerHTML="";return}
+summary.innerHTML=`<h2>档案「${esc(data.archive.name)}」版本保护状况</h2>`+data.versions.map(v=>
+`<div class="ver ${v.protected?"ok":"bad"}"><b>版本 ${v.version}</b>（${STATE[v.state]||v.state}，文件 ${v.file_count} 个，在用副本 ${v.copy_count} 份）<br>${protectionHtml(v)}</div>`).join("")}
+async function loadVersion(){const id=prompt("版本 ID","1");if(!id)return;
+const r=await fetch(`/api/versions/${id}`,{headers:{"X-User-Id":user.value}});const data=await r.json();
+out.textContent=JSON.stringify(data,null,2);
+if(!data.copies){summary.innerHTML="";return}
+const copies=data.copies.map(c=>`<tr><td>${c.id}</td><td>${esc(c.location)}</td><td>${STATE[c.state]||c.state}</td><td>${c.last_verified_at||"—"}</td></tr>`).join("");
+const incidents=(data.incidents||[]).map(i=>`<tr><td>${i.detected_at}</td><td>${esc(i.location)}</td><td>${i.corrupt_paths.map(esc).join("<br>")}</td><td>${i.resolved_at||"未解决"}</td></tr>`).join("");
+summary.innerHTML=`<h2>版本 ${data.version.version} 保护状况</h2><p>${protectionHtml(data.protection)}</p>
+<h3>副本</h3><table><tr><th>ID</th><th>存储位置</th><th>状态</th><th>最近校验时间</th></tr>${copies}</table>
+<h3>损坏记录</h3><table><tr><th>发现时间</th><th>存储位置</th><th>损坏清单</th><th>解决时间</th></tr>${incidents||'<tr><td colspan="4">无</td></tr>'}</table>`}
+</script></body></html>
