@@ -1,7 +1,106 @@
 <!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>数字档案长期保存</title>
-<style>body{font:16px system-ui;max-width:980px;margin:32px auto;padding:0 16px}input,textarea,button,select{font:inherit;padding:8px;margin:4px}textarea{width:100%;height:110px}.panel{border:1px solid #bbb;padding:16px;border-radius:8px;margin:12px 0}pre{background:#f4f4f4;padding:12px;white-space:pre-wrap}</style></head>
-<body><h1>数字档案长期保存</h1><p>演示账号：owner、archivist、auditor、outsider。请求使用 <code>X-User-Id</code>。</p>
-<section class="panel"><select id="user"><option>owner</option><option>archivist</option><option>auditor</option><option>outsider</option></select>
-<button onclick="loadStatus()">查看档案状态</button><pre id="out"></pre></section>
-<p>详细接口见 README。页面用于完成初始化后的状态检查，核心流程由 JSON API 提供。</p>
-<script>const out=document.querySelector("#out"),user=document.querySelector("#user");async function loadStatus(){const id=prompt("档案 ID","1");const r=await fetch(`/api/archives/${id}/status`,{headers:{"X-User-Id":user.value}});out.textContent=JSON.stringify(await r.json(),null,2)}</script></body></html>
+<style>
+body{font:16px system-ui;max-width:1040px;margin:32px auto;padding:0 16px}
+input,textarea,button,select{font:inherit;padding:8px;margin:4px}
+textarea{width:100%;height:90px}
+.panel{border:1px solid #bbb;padding:16px;border-radius:8px;margin:12px 0}
+pre{background:#f4f4f4;padding:12px;white-space:pre-wrap;font-size:13px}
+.badge{display:inline-block;padding:3px 10px;border-radius:12px;font-weight:700;color:#fff}
+.badge.protected{background:#1a7f37}
+.badge.at_risk{background:#c11}
+.state-healthy{color:#1a7f37;font-weight:700}
+.state-pending_retirement,.state-corrupt{color:#c11;font-weight:700}
+.state-rebuilding{color:#b36b00;font-weight:700}
+.state-retired{color:#777;font-weight:700}
+.safeguards{background:#fff4f4;border:1px solid #e0b4b4;border-radius:8px;padding:10px;margin:8px 0}
+.safeguards ul{margin:6px 0 0 1.2em;padding:0}
+table{border-collapse:collapse;width:100%;margin:8px 0}
+th,td{border:1px solid #ccc;padding:6px 8px;text-align:left;font-size:14px}
+.small{font-size:13px;color:#555}
+button{cursor:pointer}
+</style></head>
+<body>
+<h1>数字档案长期保存</h1>
+<p class="small">演示账号：owner、archivist、auditor、outsider。请求使用 <code>X-User-Id</code>。巡检（verify）auditor 可执行；登记替换位置、重建、接替仅 owner / archivist。</p>
+<section class="panel">
+  当前用户：<select id="user"><option>owner</option><option>archivist</option><option>auditor</option><option>outsider</option></select>
+  档案 ID：<input id="archiveId" value="1" size="4">
+  <button onclick="loadStatus()">查看档案状态</button>
+  <div id="summary"></div>
+</section>
+<section class="panel">
+  <b>单副本操作</b><br>
+  副本 ID：<input id="copyId" size="4">
+  文件路径：<input id="filePath" size="22" placeholder="如 records/one.xml">
+  <button onclick="call('POST','/api/copies/'+copyId.value+'/verify',null,'verify')">巡检</button>
+  <button onclick="call('POST','/api/copies/'+copyId.value+'/simulate-corruption',{path:filePath.value},'simulate')">模拟损坏</button>
+  <button onclick="call('POST','/api/copies/'+copyId.value+'/rebuild',null,'rebuild')">重建/重新同步</button>
+  <button onclick="call('POST','/api/copies/'+copyId.value+'/complete-replacement',null,'complete')">全量校验并接替</button>
+</section>
+<section class="panel">
+  <b>登记替换位置</b><br>
+  版本 ID：<input id="versionId" size="4">
+  待退役副本 ID（可空，默认最早）：<input id="oldCopyId" size="4">
+  新存储位置：<input id="newLocation" size="22" placeholder="如 offline-disk-c">
+  <button onclick="registerReplacement()">登记新位置并重建</button>
+  <button onclick="loadVersion()">查看版本明细</button>
+</section>
+<pre id="out">就绪。先“查看档案状态”。</pre>
+<script>
+const out=document.querySelector("#out"),summary=document.querySelector("#summary");
+const H=()=>({"X-User-Id":document.querySelector("#user").value,"Content-Type":"application/json"});
+const esc=s=>String(s??"").replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
+async function call(method,url,body,tag){
+  try{
+    const r=await fetch(url,{method,headers:H(),body:body?JSON.stringify(body):undefined});
+    const data=await r.json();
+    out.textContent=(tag?`[${tag}] ${r.status}\n`:"")+JSON.stringify(data,null,2);
+    return data;
+  }catch(e){out.textContent=String(e);}
+}
+async function registerReplacement(){
+  const oid=document.querySelector("#oldCopyId").value.trim();
+  await call("POST",`/api/versions/${versionId.value}/replacements`,
+    {location:document.querySelector("#newLocation").value.trim(),...(oid?{replaces_copy_id:Number(oid)}:{})},"register");
+}
+async function loadVersion(){
+  const d=await call("GET","/api/versions/"+versionId.value,null,null);
+  if(d) renderVersion(d);
+}
+function protectionBadge(p){
+  if(!p) return "";
+  const cls=p.state==="protected"?"protected":"at_risk";
+  const label=p.state==="protected"?"受保护":"缺少保障";
+  let extra="";
+  if(p.state!=="protected" && p.missing_safeguards.length){
+    extra=`<div class="safeguards"><b>${esc(p.message)}</b><ul>${p.missing_safeguards.map(m=>`<li>${esc(m)}</li>`).join("")}</ul></div>`;
+  }
+  return `<span class="badge ${cls}">${label}</span> 健康副本 ${p.healthy_copy_count}/${p.minimum_healthy_copies}`
+    +(p.open_damage_reports?` · 未闭环损坏清单 ${p.open_damage_reports}`:"")+extra;
+}
+async function loadStatus(){
+  const id=document.querySelector("#archiveId").value.trim();
+  const d=await call("GET",`/api/archives/${id}/status`,null,null);
+  if(!d||!d.versions) { summary.innerHTML=""; return; }
+  summary.innerHTML=d.versions.map(v=>`
+    <div class="panel">
+      <b>版本 ${v.version}</b>（version id ${v.id}，文件 ${v.file_count}，副本 ${v.copy_count}）
+      ${protectionBadge(v.protection)}
+      <div class="small">版本状态：${v.state==="verified"?"verified（已核验）":"degraded（缺少保障）"}${v.open_damage_reports?`；待处理损坏清单 ${v.open_damage_reports}`:""}</div>
+      <button onclick="document.querySelector('#versionId').value=${v.id};loadVersion()">查看该版本副本与损坏清单</button>
+    </div>`).join("");
+}
+function renderVersion(d){
+  const copies=d.copies.map(c=>`<tr><td>${c.id}</td><td>${esc(c.location)}</td>
+    <td class="state-${c.state}">${c.state}</td><td>${c.replaces_copy_id??""}</td><td>${c.last_verified_at??""}</td></tr>`).join("");
+  const reports=d.damage_reports.map(r=>`<tr><td>${r.id}</td><td>${r.copy_id}</td><td>${r.found_at}</td>
+    <td>${esc((r.corrupt_paths||[]).join(", "))}</td><td>${r.state}</td><td>${r.replacement_copy_id??""}</td><td>${r.resolved_at??""}</td></tr>`).join("");
+  summary.innerHTML=`
+    <div class="panel"><b>版本 ${d.version.version} 保护状态</b><br>${protectionBadge(d.protection)}</div>
+    <table><thead><tr><th>副本ID</th><th>位置</th><th>状态</th><th>接替</th><th>最近校验</th></tr></thead><tbody>${copies}</tbody></table>
+    <b>损坏清单（damage_reports）</b>
+    <table><thead><tr><th>清单ID</th><th>副本</th><th>发现时间</th><th>损坏文件</th><th>状态</th><th>接替副本</th><th>闭环时间</th></tr></thead>
+    <tbody>${reports||'<tr><td colspan="7">无</td></tr>'}</tbody></table>`;
+  document.querySelector("#versionId").value=d.version.id;
+}
+</script></body></html>
